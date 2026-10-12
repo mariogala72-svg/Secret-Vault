@@ -6,6 +6,8 @@ Questo repository contiene l'**applicazione** (Next.js + Firebase + Resend, depl
 
 ## L'app
 
+**Online:** https://secret-vault-green.vercel.app (Vercel, deploy automatico a ogni push sul branch principale)
+
 | | |
 |---|---|
 | Frontend | Next.js 16 (App Router), React 19, TailwindCSS 4, TipTap, Motion |
