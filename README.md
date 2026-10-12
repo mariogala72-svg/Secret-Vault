@@ -2,7 +2,51 @@
 
 > Una cassaforte digitale per le parole che contano: messaggi cifrati, consegnati alla persona giusta, nel momento giusto. Anche quando non ci saremo più.
 
-Questo repository contiene, in questa fase, la **progettazione completa** dell'applicazione: specifica, architettura, modello dati, wireframe, flussi, pseudo-codice, roadmap e analisi etico-legale. Il codice arriverà a partire dalla fase MVP descritta in [docs/08-roadmap-rischi.md](docs/08-roadmap-rischi.md).
+Questo repository contiene l'**applicazione** (Next.js + Firebase + Resend, deploy su Vercel) e la **progettazione completa** in [`docs/`](docs).
+
+## L'app
+
+| | |
+|---|---|
+| Frontend | Next.js 16 (App Router), React 19, TailwindCSS 4, TipTap, Motion |
+| Autenticazione | Firebase Authentication (email + password), email di verifica e reset inviate con Resend |
+| Database | Cloud Firestore, accessibile **solo** dalle API server (Admin SDK); le regole negano ogni accesso diretto dal browser |
+| Allegati | Cifrati nel browser a blocchi da 512 KB e salvati in Firestore |
+| Email | Resend (template HTML in `src/lib/server/email.ts`) |
+| SMS (facoltativo) | Twilio: se configurato, il codice viaggia via SMS separato dal link |
+| Scheduler | Vercel Cron giornaliero su `/api/cron` + esecuzione "opportunistica" a ogni accesso degli utenti (al massimo ogni 2 minuti) |
+| Crittografia | WebCrypto AES-256-GCM, Argon2id (hash-wasm), ECIES P-256, chiave di recupero BIP-39 (24 parole), timelock drand (tlock-js) |
+
+### Funzionalità
+- Registrazione, verifica email, login, reset password, conferma con password per le azioni sensibili.
+- **Cassaforte** con seconda password che non lascia mai il dispositivo, chiave di recupero di 24 parole, blocco automatico dopo 10 minuti, limite ai tentativi.
+- **Messaggi** con editor ricco, allegati (PDF, Word, JPG, PNG), rubrica cifrata, più destinatari.
+- **Consegna**: data speciale (codice sigillato a tempo con drand), invio immediato o manuale, **testamento digitale**.
+- **Testamento digitale**: controllo periodico, persone di fiducia con quorum, periodo di ripensamento, annullamento, nessun invio notturno per i messaggi post-mortem.
+- **Destinatario**: link personale, registrazione con l'email destinataria, codice di accesso (blocco dopo 5 errori), lettura e download decifrati nel browser, reinvio del codice per 90 giorni.
+- Registro attività, eliminazione account con distruzione delle chiavi, tema chiaro/scuro, mobile-first.
+
+### Sviluppo locale
+```bash
+npm install
+cp .env.example .env.local      # compila i valori (o usa gli emulatori, vedi in fondo al file)
+npm run emulators               # facoltativo: Auth + Firestore in locale (richiede Java)
+npm run dev
+npm test                        # test della crittografia
+```
+
+### Deploy su Vercel
+1. Crea un progetto Firebase, abilita **Authentication → Email/Password** e **Firestore** (modalità produzione, regione europea, es. `eur3`).
+2. Pubblica le regole: `npx firebase-tools deploy --only firestore:rules --project <id>` (negano tutto ai client).
+3. In Authentication → Impostazioni → Domini autorizzati aggiungi il dominio Vercel.
+4. Imposta su Vercel le variabili di `.env.example` (Firebase client e Admin, `SERVER_ENC_KEY`, `CRON_SECRET`, `RESEND_API_KEY`, `EMAIL_FROM`).
+
+> `SERVER_ENC_KEY` protegge recapiti e codici custoditi: generala una volta (`openssl rand -base64 32`) e non cambiarla mai in produzione.
+
+### Differenze rispetto alla progettazione (MVP)
+- Firestore al posto di PostgreSQL + Redis, come richiesto; lo scheduler usa Vercel Cron (sul piano Hobby è giornaliero: per una precisione al minuto basta un cron esterno che chiami `/api/cron` con `Authorization: Bearer $CRON_SECRET`).
+- Per il trigger decesso il codice è custodito con la chiave del server (`SERVER_ENC_KEY`); la suddivisione Shamir con le persone di fiducia è prevista nella v1.
+- Lingua: solo italiano per ora (inglese in roadmap).
 
 ---
 
