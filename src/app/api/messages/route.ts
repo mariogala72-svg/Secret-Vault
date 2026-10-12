@@ -1,20 +1,18 @@
-import { FieldValue } from "firebase-admin/firestore";
 import { audit } from "@/lib/server/audit";
 import { requireUser } from "@/lib/server/auth";
+import { sql } from "@/lib/server/db";
 import { initialStatuses, sweepDueDeliveries } from "@/lib/server/engine";
-import { db } from "@/lib/server/firebase";
 import { HttpError, ok, route } from "@/lib/server/http";
-import { assertChunksUploaded, assertTriggerAllowed, deliveryDoc, MessageSchema, messageView } from "@/lib/server/messages";
+import { assertChunksUploaded, assertTriggerAllowed, deliveryRow, MessageSchema, messageView, triggerJson } from "@/lib/server/messages";
 
 export const GET = route(async (req) => {
   const user = await requireUser(req);
   const [ms, ds] = await Promise.all([
-    db().collection("messages").where("ownerUid", "==", user.uid).select("status", "encTitle", "ownerWrappedDek", "attachments", "trigger", "createdAt", "updatedAt").get(),
-    db().collection("deliveries").where("ownerUid", "==", user.uid).get(),
+    sql()`select id, status, enc_title, owner_wrapped_dek, attachments, trigger, created_at, updated_at from messages where owner_id = ${user.uid} order by updated_at desc`,
+    sql()`select * from deliveries where owner_id = ${user.uid} order by created_at`,
   ]);
-  const byMsg = Map.groupBy(ds.docs, (d) => d.get("messageId") as string);
-  const messages = ms.docs.map((m) => messageView(m, byMsg.get(m.id) ?? [])).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-  return ok({ messages });
+  const byMsg = Map.groupBy(ds, (d) => d.message_id as string);
+  return ok({ messages: ms.map((m) => messageView(m, byMsg.get(m.id) ?? [])) });
 });
 
 export const POST = route(async (req) => {
@@ -24,22 +22,15 @@ export const POST = route(async (req) => {
   await assertTriggerAllowed(user.uid, input);
   await assertChunksUploaded(user.uid, input.id, input.attachments);
 
-  const ref = db().collection("messages").doc(input.id);
   const st = initialStatuses(input.trigger, input.intent);
-  await db().runTransaction(async (tx) => {
-    if ((await tx.get(ref)).exists) throw new HttpError(409, "Messaggio già esistente");
-    tx.set(ref, {
-      ownerUid: user.uid,
-      status: st.message,
-      encTitle: input.encTitle,
-      encBody: input.encBody,
-      ownerWrappedDek: input.ownerWrappedDek,
-      attachments: input.attachments,
-      trigger: { kind: input.trigger.kind, fireAt: input.trigger.fireAt ?? null, occasion: input.trigger.occasion ?? null },
-      createdAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp(),
-    });
-    for (const d of input.deliveries) tx.set(db().collection("deliveries").doc(), deliveryDoc(user.uid, input.id, d, st));
+  await sql().begin(async (tx) => {
+    const [m] = await tx`
+      insert into messages (id, owner_id, status, enc_title, enc_body, owner_wrapped_dek, attachments, trigger)
+      values (${input.id}, ${user.uid}, ${st.message}, ${input.encTitle}, ${input.encBody}, ${input.ownerWrappedDek},
+        ${tx.json(input.attachments)}, ${tx.json(triggerJson(input.trigger))})
+      on conflict (id) do nothing returning id`;
+    if (!m) throw new HttpError(409, "Messaggio già esistente");
+    for (const d of input.deliveries) await tx`insert into deliveries ${tx(deliveryRow(user.uid, input.id, d, st))}`;
   });
   await audit(user.uid, input.intent === "draft" ? "MESSAGE_DRAFT" : "MESSAGE_SCHEDULED", { messageId: input.id, trigger: input.trigger.kind });
   if (input.intent === "schedule" && input.trigger.kind === "MANUAL_NOW") await sweepDueDeliveries();

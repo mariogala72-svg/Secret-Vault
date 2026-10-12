@@ -16,6 +16,13 @@ type Handler<C> = (req: Request, ctx: C) => Promise<Response>;
 export function route<C = unknown>(fn: Handler<C>): Handler<C> {
   return async (req, ctx) => {
     try {
+      // CSRF defence in depth (cookies are SameSite=Lax): mutating requests must come from our own origin.
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        const origin = req.headers.get("origin");
+        if (origin && new URL(origin).host !== new URL(req.url).host && origin !== appUrl()) {
+          throw new HttpError(403, "Origine non consentita");
+        }
+      }
       return await fn(req, ctx);
     } catch (e) {
       if (e instanceof HttpError) return NextResponse.json({ error: e.message, code: e.code }, { status: e.status });
@@ -36,6 +43,5 @@ export const iso = (v: unknown): string | null => {
   if (!v) return null;
   if (typeof v === "string") return v;
   if (v instanceof Date) return v.toISOString();
-  if (typeof v === "object" && v && "toDate" in v) return (v as { toDate(): Date }).toDate().toISOString();
   return null;
 };

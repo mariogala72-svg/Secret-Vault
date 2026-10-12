@@ -1,11 +1,10 @@
 "use client";
-import { onIdTokenChanged, signOut, type User } from "firebase/auth";
 import { createContext, useCallback, useContext, useEffect, useState } from "react";
-import { api } from "./api";
-import { clientAuth, firebaseConfigured } from "./firebase";
+import { api, ApiError } from "./api";
 import type { DeathSwitch } from "../types";
 
 export type Me = {
+  id: string;
   displayName: string;
   email: string;
   emailVerified: boolean;
@@ -20,47 +19,48 @@ export type Me = {
 };
 
 type Ctx = {
-  user: User | null;
+  user: { uid: string; email: string } | null;
   me: Me | null;
   loading: boolean;
   configured: boolean;
-  refresh: () => Promise<void>;
-  logout: () => Promise<void>;
+  refresh: () => Promise<Me | null>;
+  logout: (redirectTo?: string) => Promise<void>;
 };
 
 const AuthContext = createContext<Ctx | null>(null);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const configured = firebaseConfigured();
-  const [user, setUser] = useState<User | null>(null);
   const [me, setMe] = useState<Me | null>(null);
-  const [loading, setLoading] = useState(configured);
+  const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async () => {
-    if (!clientAuth().currentUser) return setMe(null);
     try {
-      setMe(await api<Me>("/api/me"));
-    } catch {
-      setMe(null);
+      const m = await api<Me>("/api/me");
+      setMe(m);
+      return m;
+    } catch (e) {
+      if (!(e instanceof ApiError) || e.status === 401) setMe(null);
+      return null;
+    } finally {
+      setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    if (!configured) return;
-    return onIdTokenChanged(clientAuth(), async (u) => {
-      setUser(u);
-      if (u) await refresh();
-      else setMe(null);
-      setLoading(false);
-    });
-  }, [configured, refresh]);
-
-  const logout = useCallback(async () => {
-    sessionStorage.clear();
-    await signOut(clientAuth());
+    api<Me>("/api/me").then(setMe, () => setMe(null)).finally(() => setLoading(false));
   }, []);
 
-  return <AuthContext.Provider value={{ user, me, loading, configured, refresh, logout }}>{children}</AuthContext.Provider>;
+  /** Full page navigation afterwards: wipes every in-memory key along with the page. */
+  const logout = useCallback(async (redirectTo = "/") => {
+    await api("/api/auth/logout", { method: "POST" }).catch(() => {});
+    try {
+      localStorage.removeItem("sv:after-verify");
+    } catch {}
+    window.location.replace(redirectTo);
+  }, []);
+
+  const user = me ? { uid: me.id, email: me.email } : null;
+  return <AuthContext.Provider value={{ user, me, loading, configured: true, refresh, logout }}>{children}</AuthContext.Provider>;
 }
 
 export function useAuth() {

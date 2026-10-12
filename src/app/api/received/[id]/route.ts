@@ -1,6 +1,6 @@
 import { assertNotCodeLocked, getReceivedDelivery } from "@/lib/server/access";
 import { requireUser } from "@/lib/server/auth";
-import { db } from "@/lib/server/firebase";
+import { sql } from "@/lib/server/db";
 import { iso, ok, route } from "@/lib/server/http";
 import { openStr } from "@/lib/server/seal";
 
@@ -10,25 +10,25 @@ export const GET = route<Ctx>(async (req, { params }) => {
   const user = await requireUser(req);
   const d = await getReceivedDelivery(user, (await params).id);
   assertNotCodeLocked(d);
-  const [m, owner] = await Promise.all([
-    db().collection("messages").doc(d.get("messageId")).get(),
-    db().collection("users").doc(d.get("ownerUid")).get(),
+  const [[m], [owner]] = await Promise.all([
+    sql()`select * from messages where id = ${d.message_id}`,
+    sql()`select display_name, status from users where id = ${d.owner_id}`,
   ]);
   return ok({
     id: d.id,
     messageId: m.id,
-    senderName: owner.get("displayName"),
-    postMortem: owner.get("status") === "DECEASED",
-    writtenAt: iso(m.get("createdAt")),
-    sentAt: iso(d.get("sentAt")),
-    openedAt: iso(d.get("openedAt")),
-    keyMode: d.get("keyMode"),
-    codeHint: d.get("codeHintSealed") ? openStr(d.get("codeHintSealed")) : null,
-    canResendCode: !!d.get("codeReserveSealed"),
-    wrappedDek: d.get("wrappedDek"),
-    codeSalt: d.get("codeSalt"),
-    encTitle: m.get("encTitle"),
-    encBody: m.get("encBody"),
-    attachments: m.get("attachments") ?? [],
+    senderName: owner.display_name,
+    postMortem: owner.status === "DECEASED",
+    writtenAt: iso(m.created_at),
+    sentAt: iso(d.sent_at),
+    openedAt: iso(d.opened_at),
+    keyMode: d.key_mode,
+    codeHint: d.code_hint_sealed ? openStr(d.code_hint_sealed as string) : null,
+    canResendCode: !!d.code_reserve_sealed,
+    wrappedDek: d.wrapped_dek,
+    codeSalt: d.code_salt,
+    encTitle: m.enc_title,
+    encBody: m.enc_body,
+    attachments: m.attachments ?? [],
   });
 });

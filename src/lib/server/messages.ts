@@ -1,14 +1,13 @@
 import "server-only";
-import { FieldValue, Timestamp, type DocumentSnapshot } from "firebase-admin/firestore";
 import { z } from "zod";
-import { DEFAULT_SWITCH, acceptedExecutors, initialStatuses } from "./engine";
-import { db } from "./firebase";
+import { sql, type Row } from "./db";
+import { acceptedExecutors, initialStatuses } from "./engine";
 import { HttpError, iso } from "./http";
 import { emailIndex, maskEmail, normalizeEmail, openStr, sealStr } from "./seal";
 import type { DeliveryView, MessageInput, MessageView } from "../types";
 
 const b64 = (max: number) => z.string().max(max).regex(/^[A-Za-z0-9+/=]*$/);
-const id = z.string().regex(/^[A-Za-z0-9-]{8,64}$/);
+const id = z.string().uuid();
 
 export const TriggerSchema = z
   .object({
@@ -42,6 +41,8 @@ export const MessageSchema = z.object({
   deliveries: z.array(DeliverySchema).max(10),
 });
 
+export const triggerJson = (t: MessageInput["trigger"]) => ({ kind: t.kind, fireAt: t.fireAt ?? null, occasion: t.occasion ?? null });
+
 export async function assertTriggerAllowed(uid: string, input: MessageInput) {
   const t = input.trigger;
   if (input.intent === "draft") return;
@@ -50,10 +51,9 @@ export async function assertTriggerAllowed(uid: string, input: MessageInput) {
     throw new HttpError(400, "La data di invio deve essere nel futuro");
   }
   if (t.kind === "DEATH" || t.kind === "DATE_OR_DEATH") {
-    const u = await db().collection("users").doc(uid).get();
-    const sw = { ...DEFAULT_SWITCH, ...(u.get("deathSwitch") ?? {}) };
+    const [u] = await sql()`select ds_enabled, ds_allow_unattended from users where id = ${uid}`;
     const execs = await acceptedExecutors(uid);
-    if (!sw.enabled || (execs.length === 0 && !sw.allowUnattended)) {
+    if (!u.ds_enabled || (execs.length === 0 && !u.ds_allow_unattended)) {
       throw new HttpError(400, "Per questa opzione attiva prima il testamento digitale con almeno una persona di fiducia", "WILL_NOT_READY");
     }
   }
@@ -63,84 +63,75 @@ export async function assertTriggerAllowed(uid: string, input: MessageInput) {
   }
 }
 
-export function deliveryDoc(uid: string, messageId: string, d: MessageInput["deliveries"][number], st: ReturnType<typeof initialStatuses>) {
+export function deliveryRow(uid: string, messageId: string, d: MessageInput["deliveries"][number], st: ReturnType<typeof initialStatuses>) {
   const email = normalizeEmail(d.email);
   return {
-    messageId,
-    ownerUid: uid,
-    contactId: d.contactId,
-    sealedName: sealStr(d.name),
-    sealedEmail: sealStr(email),
-    sealedPhone: d.phone ? sealStr(d.phone) : null,
-    emailIdx: emailIndex(email),
-    emailMasked: maskEmail(email),
-    keyMode: d.keyMode,
-    wrappedDek: d.wrappedDek,
-    codeSalt: d.codeSalt,
-    escrowSealed: d.escrow ? sealStr(d.escrow, "escrow") : null,
-    codeHintSealed: d.codeHint ? sealStr(d.codeHint) : null,
+    message_id: messageId,
+    owner_id: uid,
+    contact_id: d.contactId,
+    sealed_name: sealStr(d.name),
+    sealed_email: sealStr(email),
+    sealed_phone: d.phone ? sealStr(d.phone) : null,
+    email_idx: emailIndex(email),
+    email_masked: maskEmail(email),
+    key_mode: d.keyMode,
+    wrapped_dek: d.wrappedDek,
+    code_salt: d.codeSalt,
+    escrow_sealed: d.escrow ? sealStr(d.escrow, "escrow") : null,
+    code_hint_sealed: d.codeHint ? sealStr(d.codeHint) : null,
     status: st.delivery,
-    pendingDueAt: st.delivery === "PENDING" && st.dueAt ? Timestamp.fromDate(st.dueAt) : null,
-    dueAt: st.dueAt ? Timestamp.fromDate(st.dueAt) : null,
-    attempts: 0,
-    failedCodeAttempts: 0,
-    createdAt: FieldValue.serverTimestamp(),
+    pending_due_at: st.delivery === "PENDING" ? st.dueAt : null,
+    due_at: st.dueAt,
   };
 }
 
-export function deliveryView(d: DocumentSnapshot): DeliveryView {
+export function deliveryView(d: Row): DeliveryView {
   return {
-    id: d.id,
-    contactId: d.get("contactId"),
-    name: openStr(d.get("sealedName")),
-    emailMasked: d.get("emailMasked"),
-    keyMode: d.get("keyMode"),
-    status: d.get("status"),
-    dueAt: iso(d.get("dueAt")),
-    sentAt: iso(d.get("sentAt")),
-    openedAt: iso(d.get("openedAt")),
-    lastError: d.get("status") === "FAILED" || d.get("attempts") > 0 ? (d.get("lastError") ?? null) : null,
+    id: d.id as string,
+    contactId: d.contact_id as string,
+    name: openStr(d.sealed_name as string),
+    emailMasked: d.email_masked as string,
+    keyMode: d.key_mode as DeliveryView["keyMode"],
+    status: d.status as DeliveryView["status"],
+    dueAt: iso(d.due_at),
+    sentAt: iso(d.sent_at),
+    openedAt: iso(d.opened_at),
+    lastError: d.status === "FAILED" || (d.attempts as number) > 0 ? ((d.last_error as string) ?? null) : null,
   };
 }
 
-export function messageView(m: DocumentSnapshot, deliveries: DocumentSnapshot[], withBody = false): MessageView {
+export function messageView(m: Row, deliveries: Row[], withBody = false): MessageView {
   return {
-    id: m.id,
-    status: m.get("status"),
-    encTitle: m.get("encTitle"),
-    ...(withBody ? { encBody: m.get("encBody") } : {}),
-    ownerWrappedDek: m.get("ownerWrappedDek"),
-    attachments: m.get("attachments") ?? [],
-    trigger: m.get("trigger"),
-    createdAt: iso(m.get("createdAt"))!,
-    updatedAt: iso(m.get("updatedAt"))!,
+    id: m.id as string,
+    status: m.status as MessageView["status"],
+    encTitle: m.enc_title as string,
+    ...(withBody ? { encBody: m.enc_body as string } : {}),
+    ownerWrappedDek: m.owner_wrapped_dek as string,
+    attachments: (m.attachments as MessageView["attachments"]) ?? [],
+    trigger: m.trigger as MessageView["trigger"],
+    createdAt: iso(m.created_at)!,
+    updatedAt: iso(m.updated_at)!,
     deliveries: deliveries.map(deliveryView),
   };
 }
 
-export async function getOwnedMessage(uid: string, messageId: string) {
-  const m = await db().collection("messages").doc(messageId).get();
-  if (!m.exists || m.get("ownerUid") !== uid) throw new HttpError(404, "Messaggio non trovato");
+export async function getOwnedMessage(uid: string, messageId: string): Promise<Row> {
+  if (!z.string().uuid().safeParse(messageId).success) throw new HttpError(404, "Messaggio non trovato");
+  const [m] = await sql()`select * from messages where id = ${messageId} and owner_id = ${uid}`;
+  if (!m) throw new HttpError(404, "Messaggio non trovato");
   return m;
 }
 
 export async function deleteChunks(messageId: string, keepAttachmentIds: string[] = []) {
-  const s = await db().collection("chunks").where("messageId", "==", messageId).select("aid").get();
-  const toDelete = s.docs.filter((d) => !keepAttachmentIds.includes(d.get("aid")));
-  for (let i = 0; i < toDelete.length; i += 400) {
-    const batch = db().batch();
-    toDelete.slice(i, i + 400).forEach((d) => batch.delete(d.ref));
-    await batch.commit();
-  }
+  if (keepAttachmentIds.length) await sql()`delete from chunks where message_id = ${messageId} and aid <> all(${keepAttachmentIds}::uuid[])`;
+  else await sql()`delete from chunks where message_id = ${messageId}`;
 }
 
 export async function assertChunksUploaded(uid: string, messageId: string, attachments: MessageInput["attachments"]) {
   if (!attachments.length) return;
-  const s = await db().collection("chunks").where("messageId", "==", messageId).select("aid", "ownerUid").get();
-  const counts = new Map<string, number>();
-  for (const d of s.docs) {
-    if (d.get("ownerUid") !== uid) throw new HttpError(403, "Allegato non valido");
-    counts.set(d.get("aid"), (counts.get(d.get("aid")) ?? 0) + 1);
+  const rows = await sql()`select aid, owner_id, count(*)::int as n from chunks where message_id = ${messageId} group by aid, owner_id`;
+  if (rows.some((r) => r.owner_id !== uid)) throw new HttpError(403, "Allegato non valido");
+  for (const a of attachments) {
+    if ((rows.find((r) => r.aid === a.id)?.n ?? 0) < a.chunkCount) throw new HttpError(400, "Caricamento allegati incompleto, riprova");
   }
-  for (const a of attachments) if ((counts.get(a.id) ?? 0) < a.chunkCount) throw new HttpError(400, "Caricamento allegati incompleto, riprova");
 }

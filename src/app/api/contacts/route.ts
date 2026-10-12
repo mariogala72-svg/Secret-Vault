@@ -1,23 +1,24 @@
-import { FieldValue } from "firebase-admin/firestore";
 import { z } from "zod";
 import { requireUser } from "@/lib/server/auth";
-import { db } from "@/lib/server/firebase";
-import { ok, route } from "@/lib/server/http";
+import { sql } from "@/lib/server/db";
+import { HttpError, ok, route } from "@/lib/server/http";
 
-export const Contact = z.object({ id: z.string().regex(/^[A-Za-z0-9-]{8,64}$/), enc: z.string().max(10_000) });
-
-const col = (uid: string) => db().collection("users").doc(uid).collection("contacts");
+const Contact = z.object({ id: z.string().uuid(), enc: z.string().max(10_000) });
 
 /** Contacts are encrypted in the browser with the vault key: the server stores opaque blobs. */
 export const GET = route(async (req) => {
   const user = await requireUser(req);
-  const s = await col(user.uid).get();
-  return ok({ contacts: s.docs.map((d) => ({ id: d.id, enc: d.get("enc") })) });
+  const rows = await sql()`select id, enc from contacts where user_id = ${user.uid}`;
+  return ok({ contacts: rows.map((r) => ({ id: r.id, enc: r.enc })) });
 });
 
 export const POST = route(async (req) => {
   const user = await requireUser(req);
   const { id, enc } = Contact.parse(await req.json());
-  await col(user.uid).doc(id).set({ enc, updatedAt: FieldValue.serverTimestamp() });
+  const [r] = await sql()`
+    insert into contacts (id, user_id, enc) values (${id}, ${user.uid}, ${enc})
+    on conflict (id) do update set enc = excluded.enc, updated_at = now() where contacts.user_id = ${user.uid}
+    returning id`;
+  if (!r) throw new HttpError(403, "Non autorizzato");
   return ok({ id }, 201);
 });

@@ -50,7 +50,6 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     else if (!loading && user && me && !me.emailVerified) router.replace(`/verify-email?next=${encodeURIComponent(path)}`);
   }, [configured, loading, user, me, router, path]);
 
-  if (!configured) return <PageLoader label="Configurazione Firebase mancante" />;
   if (loading || !user || !me || !me.emailVerified) return <PageLoader />;
 
   const active = (n: (typeof NAV)[number]) => (n.exact ? path === n.href : path.startsWith(n.href));
@@ -86,7 +85,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <p className="truncate text-sm font-medium">{me.displayName}</p>
             <p className="truncate text-xs text-muted">{me.email}</p>
           </div>
-          <button onClick={() => logout().then(() => router.replace("/"))} className="grid size-9 place-items-center rounded-full text-muted hover:bg-surface-2 hover:text-ink" aria-label="Esci">
+          <button onClick={() => logout()} className="grid size-9 place-items-center rounded-full text-muted hover:bg-surface-2 hover:text-ink" aria-label="Esci">
             <LogOut className="size-4" />
           </button>
         </div>

@@ -1,49 +1,44 @@
 import { after } from "next/server";
 import { z } from "zod";
-import { requireUser } from "@/lib/server/auth";
-import { checkIn, DEFAULT_SWITCH, openCaseFor, runMaintenance } from "@/lib/server/engine";
-import { db } from "@/lib/server/firebase";
-import { iso, ok, route } from "@/lib/server/http";
+import { currentUser, requireUser } from "@/lib/server/auth";
+import { sql } from "@/lib/server/db";
+import { checkIn, openCaseFor, runMaintenance, switchOf } from "@/lib/server/engine";
+import { HttpError, iso, ok, route } from "@/lib/server/http";
 import { emailIndex } from "@/lib/server/seal";
 import { smsEnabled } from "@/lib/server/sms";
-import { ensureUser } from "@/lib/server/users";
 
 export const GET = route(async (req) => {
-  const user = await requireUser(req, { verified: false });
-  const snap = await ensureUser(user);
-  if (!user.emailVerified) {
-    return ok({ displayName: snap.get("displayName"), email: user.email, emailVerified: false });
-  }
-  const [vault, messages, received, invitations, openCase] = await Promise.all([
-    db().collection("vaults").doc(user.uid).get(),
-    db().collection("messages").where("ownerUid", "==", user.uid).select("status").get(),
-    db().collection("deliveries").where("emailIdx", "==", emailIndex(user.email)).select("status", "openedAt").get(),
-    db().collection("executors").where("emailIdx", "==", emailIndex(user.email)).select("status").get(),
+  const user = await currentUser(req);
+  if (!user) throw new HttpError(401, "Accesso richiesto");
+  if (!user.emailVerified) return ok({ id: user.uid, displayName: user.name, email: user.email, emailVerified: false });
+
+  const idx = emailIndex(user.email);
+  const [[u], [vault], counts, [received], [invites], openCase] = await Promise.all([
+    sql()`select * from users where id = ${user.uid}`,
+    sql()`select 1 as x from vaults where user_id = ${user.uid}`,
+    sql()`select status, count(*)::int as n from messages where owner_id = ${user.uid} group by status`,
+    sql()`select count(*)::int as total, count(*) filter (where opened_at is null)::int as unread from deliveries where email_idx = ${idx} and status in ('SENT', 'OPENED')`,
+    sql()`select count(*)::int as n from executors where email_idx = ${idx} and status = 'INVITED' and owner_id <> ${user.uid}`,
     openCaseFor(user.uid),
   ]);
 
-  const sw = { ...DEFAULT_SWITCH, ...(snap.get("deathSwitch") ?? {}) };
   // Signing in counts as a sign of life (once a day).
-  const last = snap.get("deathSwitch.lastCheckinAt")?.toMillis?.() ?? 0;
-  if (sw.enabled && Date.now() - last > 86_400_000) await checkIn(user.uid);
-
-  const counts: Record<string, number> = {};
-  for (const m of messages.docs) counts[m.get("status")] = (counts[m.get("status")] ?? 0) + 1;
-  const rec = received.docs.filter((d) => ["SENT", "OPENED"].includes(d.get("status")));
+  if (u.ds_enabled && (!u.ds_last_checkin_at || Date.now() - new Date(u.ds_last_checkin_at).getTime() > 86_400_000)) await checkIn(user.uid);
 
   after(() => runMaintenance({ minIntervalMs: 120_000 }).catch((e) => console.error("[maintenance]", e)));
 
   return ok({
-    displayName: snap.get("displayName"),
+    id: user.uid,
+    displayName: u.display_name,
     email: user.email,
     emailVerified: true,
-    status: snap.get("status"),
-    hasVault: vault.exists,
-    counts,
-    received: { total: rec.length, unread: rec.filter((d) => !d.get("openedAt")).length },
-    pendingInvitations: invitations.docs.filter((d) => d.get("status") === "INVITED").length,
-    deathSwitch: { ...sw, lastCheckinAt: iso(sw.lastCheckinAt), nextDueAt: iso(sw.nextDueAt) },
-    openCase: openCase ? { id: openCase.id, status: openCase.get("status"), contestUntil: iso(openCase.get("contestUntil")) } : null,
+    status: u.status,
+    hasVault: !!vault,
+    counts: Object.fromEntries(counts.map((c) => [c.status, c.n])),
+    received: { total: received.total, unread: received.unread },
+    pendingInvitations: invites.n,
+    deathSwitch: switchOf(u),
+    openCase: openCase ? { id: openCase.id, status: openCase.status, contestUntil: iso(openCase.contest_until) } : null,
     smsEnabled: smsEnabled(),
   });
 });
@@ -53,7 +48,6 @@ const Body = z.object({ displayName: z.string().trim().min(1).max(80) });
 export const POST = route(async (req) => {
   const user = await requireUser(req, { verified: false });
   const { displayName } = Body.parse(await req.json());
-  const snap = await ensureUser(user, displayName);
-  await snap.ref.update({ displayName });
+  await sql()`update users set display_name = ${displayName} where id = ${user.uid}`;
   return ok();
 });

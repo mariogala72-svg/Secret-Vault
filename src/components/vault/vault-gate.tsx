@@ -1,5 +1,4 @@
 "use client";
-import { EmailAuthProvider, reauthenticateWithCredential } from "firebase/auth";
 import { Download, KeyRound, Lock, Printer, ShieldCheck } from "lucide-react";
 import { motion } from "motion/react";
 import { useMemo, useState } from "react";
@@ -13,7 +12,6 @@ import { PageLoader } from "../ui/spinner";
 import { createVault, isValidRecoveryPhrase, rewrapForPassword, unlockWithPassword, unlockWithRecovery } from "@/lib/crypto/vault";
 import { api, ApiError, errorMessage } from "@/lib/client/api";
 import { useAuth } from "@/lib/client/auth";
-import { clientAuth } from "@/lib/client/firebase";
 import { useVault } from "@/lib/client/vault";
 
 /** Renders children only once the vault is unlocked; otherwise shows setup or unlock. */
@@ -166,7 +164,13 @@ function SetupVault() {
     setBusy(true);
     setError(null);
     // The vault password must differ from the login one: if it signs us in, it's the same.
-    const same = await reauthenticateWithCredential(clientAuth().currentUser!, EmailAuthProvider.credential(user.email, pw)).then(() => true, () => false);
+    let same = false;
+    try {
+      same = (await api<{ sameAsLogin: boolean }>("/api/auth/check-password", { method: "POST", json: { password: pw } })).sameAsLogin;
+    } catch (err) {
+      setBusy(false);
+      return setError(errorMessage(err));
+    }
     if (same) {
       setBusy(false);
       return setError("Usa una password diversa da quella di accesso al profilo");

@@ -2,7 +2,7 @@
 
 > Una cassaforte digitale per le parole che contano: messaggi cifrati, consegnati alla persona giusta, nel momento giusto. Anche quando non ci saremo più.
 
-Questo repository contiene l'**applicazione** (Next.js + Firebase + Resend, deploy su Vercel) e la **progettazione completa** in [`docs/`](docs).
+Questo repository contiene l'**applicazione** (Next.js + Supabase + Resend, deploy su Vercel) e la **progettazione completa** in [`docs/`](docs).
 
 ## L'app
 
@@ -11,9 +11,9 @@ Questo repository contiene l'**applicazione** (Next.js + Firebase + Resend, depl
 | | |
 |---|---|
 | Frontend | Next.js 16 (App Router), React 19, TailwindCSS 4, TipTap, Motion |
-| Autenticazione | Firebase Authentication (email + password), email di verifica e reset inviate con Resend |
-| Database | Cloud Firestore, accessibile **solo** dalle API server (Admin SDK); le regole negano ogni accesso diretto dal browser |
-| Allegati | Cifrati nel browser a blocchi da 512 KB e salvati in Firestore |
+| Autenticazione | Integrata nell'app: password Argon2id con pepper, sessioni in cookie HttpOnly, blocco dopo 5 errori, email di verifica e reset inviate con Resend |
+| Database | Supabase Postgres, accessibile **solo** dalle API server (driver `postgres`); RLS attiva su tutte le tabelle senza policy, quindi la Data API pubblica non vede nulla |
+| Allegati | Cifrati nel browser a blocchi da 512 KB e salvati in Postgres (`bytea`) |
 | Email | Resend (template HTML in `src/lib/server/email.ts`) |
 | SMS (facoltativo) | Twilio: se configurato, il codice viaggia via SMS separato dal link |
 | Scheduler | Vercel Cron giornaliero su `/api/cron` + esecuzione "opportunistica" a ogni accesso degli utenti (al massimo ogni 2 minuti) |
@@ -32,21 +32,20 @@ Questo repository contiene l'**applicazione** (Next.js + Firebase + Resend, depl
 ```bash
 npm install
 cp .env.example .env.local      # compila i valori (o usa gli emulatori, vedi in fondo al file)
-npm run emulators               # facoltativo: Auth + Firestore in locale (richiede Java)
+# database locale: crea un database Postgres e applica supabase/migrations/*.sql
 npm run dev
 npm test                        # test della crittografia
 ```
 
 ### Deploy su Vercel
-1. Crea un progetto Firebase, abilita **Authentication → Email/Password** e **Firestore** (modalità produzione, regione europea, es. `eur3`).
-2. Pubblica le regole: `npx firebase-tools deploy --only firestore:rules --project <id>` (negano tutto ai client).
-3. In Authentication → Impostazioni → Domini autorizzati aggiungi il dominio Vercel.
-4. Imposta su Vercel le variabili di `.env.example` (Firebase client e Admin, `SERVER_ENC_KEY`, `CRON_SECRET`, `RESEND_API_KEY`, `EMAIL_FROM`).
+1. Crea un progetto Supabase (regione europea) e applica `supabase/migrations/20261012000000_init.sql`.
+2. Imposta su Vercel `DATABASE_URL` (connection string del *Transaction pooler*, porta 6543) oppure collega l'integrazione Supabase di Vercel, che imposta `POSTGRES_URL`.
+3. Imposta `SERVER_ENC_KEY`, `CRON_SECRET`, `RESEND_API_KEY`, `EMAIL_FROM`.
 
 > `SERVER_ENC_KEY` protegge recapiti e codici custoditi: generala una volta (`openssl rand -base64 32`) e non cambiarla mai in produzione.
 
 ### Differenze rispetto alla progettazione (MVP)
-- Firestore al posto di PostgreSQL + Redis, come richiesto; lo scheduler usa Vercel Cron (sul piano Hobby è giornaliero: per una precisione al minuto basta un cron esterno che chiami `/api/cron` con `Authorization: Bearer $CRON_SECRET`).
+- Supabase Postgres senza Redis; lo scheduler usa Vercel Cron (sul piano Hobby è giornaliero: per una precisione al minuto basta un cron esterno che chiami `/api/cron` con `Authorization: Bearer $CRON_SECRET`).
 - Per il trigger decesso il codice è custodito con la chiave del server (`SERVER_ENC_KEY`); la suddivisione Shamir con le persone di fiducia è prevista nella v1.
 - Lingua: solo italiano per ora (inglese in roadmap).
 

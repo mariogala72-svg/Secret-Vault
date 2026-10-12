@@ -26,11 +26,3 @@ export function AuthShell({ title, subtitle, children, footer }: { title: string
     </div>
   );
 }
-
-export function NotConfigured() {
-  return (
-    <div className="rounded-2xl border border-warning/30 bg-warning/10 p-4 text-sm leading-relaxed">
-      <strong>Configurazione mancante.</strong> Imposta le variabili <code>NEXT_PUBLIC_FIREBASE_*</code> per abilitare l&apos;accesso.
-    </div>
-  );
-}

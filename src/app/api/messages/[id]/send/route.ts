@@ -1,8 +1,7 @@
-import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { audit } from "@/lib/server/audit";
 import { requireUser } from "@/lib/server/auth";
+import { sql } from "@/lib/server/db";
 import { sweepDueDeliveries } from "@/lib/server/engine";
-import { db } from "@/lib/server/firebase";
 import { HttpError, ok, route } from "@/lib/server/http";
 import { getOwnedMessage } from "@/lib/server/messages";
 
@@ -12,16 +11,13 @@ type Ctx = { params: Promise<{ id: string }> };
 export const POST = route<Ctx>(async (req, { params }) => {
   const user = await requireUser(req);
   const m = await getOwnedMessage(user.uid, (await params).id);
-  if (!["HOLD", "SCHEDULED"].includes(m.get("status"))) throw new HttpError(409, "Questo messaggio non può essere inviato ora");
-  const ds = await db().collection("deliveries").where("messageId", "==", m.id).get();
-  if (ds.docs.some((d) => d.get("keyMode") === "ESCROW_TLOCK")) {
-    throw new HttpError(409, "Questo messaggio è sigillato fino alla data scelta: nemmeno noi possiamo anticiparlo");
-  }
-  const batch = db().batch();
-  for (const d of ds.docs) if (["HOLD", "PENDING"].includes(d.get("status"))) batch.update(d.ref, { status: "PENDING", pendingDueAt: Timestamp.now() });
-  batch.update(m.ref, { status: "SCHEDULED", "trigger.kind": "MANUAL_NOW", updatedAt: FieldValue.serverTimestamp() });
-  await batch.commit();
+  if (!["HOLD", "SCHEDULED"].includes(m.status)) throw new HttpError(409, "Questo messaggio non può essere inviato ora");
+  const [tl] = await sql()`select 1 as x from deliveries where message_id = ${m.id} and key_mode = 'ESCROW_TLOCK' limit 1`;
+  if (tl) throw new HttpError(409, "Questo messaggio è sigillato fino alla data scelta: nemmeno noi possiamo anticiparlo");
+  await sql().begin(async (tx) => {
+    await tx`update deliveries set status = 'PENDING', pending_due_at = now() where message_id = ${m.id} and status in ('HOLD', 'PENDING')`;
+    await tx`update messages set status = 'SCHEDULED', trigger = jsonb_set(trigger, '{kind}', '"MANUAL_NOW"'), updated_at = now() where id = ${m.id}`;
+  });
   await audit(user.uid, "MESSAGE_SEND_NOW", { messageId: m.id });
-  const result = await sweepDueDeliveries();
-  return ok(result);
+  return ok(await sweepDueDeliveries());
 });

@@ -1,11 +1,9 @@
 "use client";
-import { EmailAuthProvider, reauthenticateWithCredential } from "firebase/auth";
 import { useState } from "react";
 import { Button } from "../ui/button";
 import { Field, PasswordInput } from "../ui/field";
 import { Modal } from "../ui/modal";
-import { friendlyAuthError } from "@/lib/client/api";
-import { clientAuth } from "@/lib/client/firebase";
+import { api, errorMessage } from "@/lib/client/api";
 
 /** Step-up authentication: sensitive actions require re-entering the login password. */
 export function ReauthModal({ open, onClose, onConfirmed, title = "Conferma la tua identità", description, confirmLabel = "Conferma", danger }: {
@@ -23,18 +21,15 @@ export function ReauthModal({ open, onClose, onConfirmed, title = "Conferma la t
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
-    const u = clientAuth().currentUser;
-    if (!u?.email) return;
     setLoading(true);
     setError(null);
     try {
-      await reauthenticateWithCredential(u, EmailAuthProvider.credential(u.email, pw));
-      await u.getIdToken(true);
+      await api("/api/auth/reauth", { method: "POST", json: { password: pw } });
       await onConfirmed();
       setPw("");
       onClose();
     } catch (err) {
-      setError(friendlyAuthError(err));
+      setError(errorMessage(err));
     } finally {
       setLoading(false);
     }

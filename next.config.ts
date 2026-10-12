@@ -2,15 +2,14 @@ import type { NextConfig } from "next";
 
 const isProd = process.env.NODE_ENV === "production";
 
-// CSP: hash-wasm (Argon2id) needs 'wasm-unsafe-eval'; Firebase Auth talks to Google APIs.
+// CSP: hash-wasm (Argon2id) needs 'wasm-unsafe-eval'; all API calls are same-origin.
 const csp = [
   "default-src 'self'",
   "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'",
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self' data:",
-  "connect-src 'self' https://*.googleapis.com https://*.firebaseio.com https://*.firebaseapp.com",
-  "frame-src https://*.firebaseapp.com",
+  "connect-src 'self'",
   "worker-src 'self' blob:",
   "object-src 'none'",
   "base-uri 'none'",

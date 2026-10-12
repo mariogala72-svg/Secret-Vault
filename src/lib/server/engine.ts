@@ -1,9 +1,8 @@
 import "server-only";
-import { FieldValue, Timestamp, type DocumentSnapshot } from "firebase-admin/firestore";
 import { mainnetClient, timelockDecrypt } from "tlock-js";
 import { audit } from "./audit";
+import { sql, type Row } from "./db";
 import { sendTemplate, templates } from "./email";
-import { db } from "./firebase";
 import { appUrl } from "./http";
 import { openStr, randomToken, sealStr, sha256, signToken } from "./seal";
 import { sendSms, smsEnabled } from "./sms";
@@ -32,16 +31,15 @@ export function initialStatuses(trigger: Trigger, intent: "draft" | "schedule"):
 }
 
 export async function recomputeMessageStatus(messageId: string) {
-  const ref = db().collection("messages").doc(messageId);
-  const [msg, ds] = await Promise.all([ref.get(), db().collection("deliveries").where("messageId", "==", messageId).get()]);
-  if (!msg.exists || ds.empty) return;
-  const st = ds.docs.map((d) => d.get("status") as DeliveryStatus);
+  const ds = await sql()`select status from deliveries where message_id = ${messageId}`;
+  if (!ds.length) return;
+  const st = ds.map((d) => d.status as DeliveryStatus);
   const done = st.filter((s) => s === "SENT" || s === "OPENED").length;
   const failed = st.filter((s) => s === "FAILED").length;
   let status: MessageStatus | null = null;
   if (done === st.length) status = "DELIVERED";
   else if (done + failed === st.length) status = done > 0 ? "PARTIAL" : "FAILED";
-  if (status && msg.get("status") !== status) await ref.update({ status, updatedAt: FieldValue.serverTimestamp() });
+  if (status) await sql()`update messages set status = ${status}, updated_at = now() where id = ${messageId} and status <> ${status}`;
 }
 
 // ------------------------------------------------------------------ delivery
@@ -61,40 +59,35 @@ function nextQuietSafeTime(now: Date): Date | null {
   return t;
 }
 
-async function claim(ref: FirebaseFirestore.DocumentReference): Promise<DocumentSnapshot | null> {
-  return db().runTransaction(async (tx) => {
-    const snap = await tx.get(ref);
-    const due = snap.get("pendingDueAt") as Timestamp | null;
-    const status = snap.get("status");
-    if (!due || due.toMillis() > Date.now() || (status !== "PENDING" && status !== "SENDING")) return null;
-    tx.update(ref, { status: "SENDING", pendingDueAt: Timestamp.fromMillis(Date.now() + LEASE_MS) });
-    return snap;
-  });
+/** Atomically takes a lease on a due delivery, so concurrent runs never send twice. */
+async function claim(id: string): Promise<Row | null> {
+  const [d] = await sql()`
+    update deliveries set status = 'SENDING', pending_due_at = ${new Date(Date.now() + LEASE_MS)}
+    where id = ${id} and status in ('PENDING', 'SENDING') and pending_due_at <= now()
+    returning *`;
+  return d ?? null;
 }
 
-async function revealCode(d: DocumentSnapshot): Promise<string | null> {
-  const mode = d.get("keyMode");
-  if (mode === "SENDER_SHARES_CODE") return null;
-  const reserve = d.get("codeReserveSealed");
-  if (reserve) return openStr(reserve, "escrow");
-  const escrow = openStr(d.get("escrowSealed"), "escrow");
-  if (mode === "ESCROW_SERVER") return escrow;
+async function revealCode(d: Row): Promise<string | null> {
+  if (d.key_mode === "SENDER_SHARES_CODE") return null;
+  if (d.code_reserve_sealed) return openStr(d.code_reserve_sealed as string, "escrow");
+  const escrow = openStr(d.escrow_sealed as string, "escrow");
+  if (d.key_mode === "ESCROW_SERVER") return escrow;
   // ESCROW_TLOCK: only openable once the drand network has published the round for the delivery date.
-  const plain = await timelockDecrypt(escrow, mainnetClient());
-  return plain.toString("utf8");
+  return (await timelockDecrypt(escrow, mainnetClient())).toString("utf8");
 }
 
-export async function releaseDelivery(ref: FirebaseFirestore.DocumentReference): Promise<"sent" | "skipped" | "retry" | "failed"> {
-  const d = await claim(ref);
+export async function releaseDelivery(id: string): Promise<"sent" | "skipped" | "retry" | "failed"> {
+  const d = await claim(id);
   if (!d) return "skipped";
-  const owner = await db().collection("users").doc(d.get("ownerUid")).get();
-  const postMortem = owner.get("status") === "DECEASED";
-  const attempts = (d.get("attempts") ?? 0) as number;
+  const [owner] = await sql()`select id, email, display_name, status from users where id = ${d.owner_id}`;
+  const postMortem = owner.status === "DECEASED";
+  const attempts = d.attempts as number;
 
   if (postMortem) {
     const later = nextQuietSafeTime(new Date());
     if (later) {
-      await ref.update({ status: "PENDING", pendingDueAt: Timestamp.fromDate(later) });
+      await sql()`update deliveries set status = 'PENDING', pending_due_at = ${later} where id = ${id}`;
       return "skipped";
     }
   }
@@ -102,109 +95,102 @@ export async function releaseDelivery(ref: FirebaseFirestore.DocumentReference):
   try {
     const code = await revealCode(d);
     let token: string;
-    if (d.get("linkTokenSealed")) token = openStr(d.get("linkTokenSealed"), "token");
+    if (d.link_token_sealed) token = openStr(d.link_token_sealed as string, "token");
     else {
       token = randomToken();
-      await ref.update({ linkTokenSealed: sealStr(token, "token"), linkTokenHash: sha256(token) });
+      await sql()`update deliveries set link_token_sealed = ${sealStr(token, "token")}, link_token_hash = ${sha256(token)} where id = ${id}`;
     }
-    const email = openStr(d.get("sealedEmail"));
-    const name = openStr(d.get("sealedName"));
-    const phone = openStr(d.get("sealedPhone"));
-    const senderName = owner.get("displayName") ?? "Una persona a te cara";
+    const phone = openStr(d.sealed_phone as string | null);
+    const senderName = (owner.display_name as string) ?? "Una persona a te cara";
     const codeBySms = !!(code && phone && smsEnabled());
 
     await sendTemplate(
-      email,
+      openStr(d.sealed_email as string),
       templates.delivery({
-        recipientName: name,
+        recipientName: openStr(d.sealed_name as string),
         senderName,
         link: `${appUrl()}/r/${token}`,
         code: codeBySms ? undefined : (code ?? undefined),
         codeBySms,
-        codeHint: d.get("codeHintSealed") ? openStr(d.get("codeHintSealed")) : undefined,
+        codeHint: d.code_hint_sealed ? openStr(d.code_hint_sealed as string) : undefined,
         postMortem,
       }),
-      `delivery-${ref.id}`,
+      `delivery-${id}`,
     );
     if (codeBySms) await sendSms(phone, `Secret Vault: il codice per il messaggio di ${senderName} è ${code}. Il link ti è arrivato via email.`);
 
-    await ref.update({
-      status: "SENT",
-      sentAt: FieldValue.serverTimestamp(),
-      pendingDueAt: null,
-      attempts: attempts + 1,
-      lastError: null,
-      escrowSealed: FieldValue.delete(),
-      // Kept only until the first opening, so the code can be re-sent if lost.
-      ...(code ? { codeReserveSealed: sealStr(code, "escrow"), reserveExpiresAt: Timestamp.fromMillis(Date.now() + 90 * DAY) } : {}),
-    });
-    await audit(d.get("ownerUid"), "DELIVERY_SENT", { deliveryId: ref.id, postMortem });
-    await recomputeMessageStatus(d.get("messageId"));
+    // The escrowed code is destroyed; a sealed copy is kept 90 days only to allow "send me the code again".
+    await sql()`
+      update deliveries set
+        status = 'SENT', sent_at = now(), pending_due_at = null, attempts = ${attempts + 1}, last_error = null,
+        escrow_sealed = null,
+        code_reserve_sealed = ${code ? sealStr(code, "escrow") : null},
+        reserve_expires_at = ${code ? new Date(Date.now() + 90 * DAY) : null}
+      where id = ${id}`;
+    await audit(d.owner_id as string, "DELIVERY_SENT", { deliveryId: id, postMortem });
+    await recomputeMessageStatus(d.message_id as string);
     return "sent";
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     const tooEarly = /too early/i.test(msg);
     const next = attempts + 1;
-    console.error("[delivery] failed", ref.id, msg);
+    console.error("[delivery] failed", id, msg);
     if (!tooEarly && next >= RETRY_MINUTES.length + 1) {
-      await ref.update({ status: "FAILED", pendingDueAt: null, attempts: next, lastError: msg.slice(0, 200) });
-      await audit(d.get("ownerUid"), "DELIVERY_FAILED", { deliveryId: ref.id });
-      if (!postMortem && owner.get("email")) {
-        await sendTemplate(owner.get("email"), templates.deliveryFailed({ name: owner.get("displayName"), recipient: d.get("emailMasked"), link: `${appUrl()}/app/messages/${d.get("messageId")}` })).catch(() => {});
+      await sql()`update deliveries set status = 'FAILED', pending_due_at = null, attempts = ${next}, last_error = ${msg.slice(0, 200)} where id = ${id}`;
+      await audit(d.owner_id as string, "DELIVERY_FAILED", { deliveryId: id });
+      if (!postMortem) {
+        await sendTemplate(owner.email, templates.deliveryFailed({ name: owner.display_name, recipient: d.email_masked as string, link: `${appUrl()}/app/messages/${d.message_id}` })).catch(() => {});
       }
-      await recomputeMessageStatus(d.get("messageId"));
+      await recomputeMessageStatus(d.message_id as string);
       return "failed";
     }
     const delayMin = tooEarly ? 2 : RETRY_MINUTES[Math.min(attempts, RETRY_MINUTES.length - 1)];
-    await ref.update({
-      status: "PENDING",
-      pendingDueAt: Timestamp.fromMillis(Date.now() + delayMin * 60_000),
-      attempts: tooEarly ? attempts : next,
-      lastError: msg.slice(0, 200),
-    });
+    await sql()`
+      update deliveries set status = 'PENDING', pending_due_at = ${new Date(Date.now() + delayMin * 60_000)},
+        attempts = ${tooEarly ? attempts : next}, last_error = ${msg.slice(0, 200)}
+      where id = ${id}`;
     return "retry";
   }
 }
 
 export async function sweepDueDeliveries(limit = 40) {
-  const due = await db().collection("deliveries").where("pendingDueAt", "<=", Timestamp.now()).limit(limit).get();
+  const due = await sql()`select id from deliveries where pending_due_at <= now() order by pending_due_at limit ${limit}`;
   const results = { sent: 0, retry: 0, failed: 0, skipped: 0 };
-  for (const doc of due.docs) results[await releaseDelivery(doc.ref)]++;
+  for (const d of due) results[await releaseDelivery(d.id)]++;
   return results;
 }
 
 // ------------------------------------------------------------------ digital will
 
-export const DEFAULT_SWITCH: DeathSwitch = {
-  enabled: false,
-  intervalDays: 90,
-  graceDays: 30,
-  quorum: 1,
-  contestHours: 72,
-  allowUnattended: false,
-  lastCheckinAt: null,
-  nextDueAt: null,
-};
-
-export async function checkIn(uid: string) {
-  const ref = db().collection("users").doc(uid);
-  const u = await ref.get();
-  const sw = { ...DEFAULT_SWITCH, ...(u.get("deathSwitch") ?? {}) };
-  await ref.update({
-    "deathSwitch.lastCheckinAt": Timestamp.now(),
-    "deathSwitch.nextDueAt": sw.enabled ? Timestamp.fromMillis(Date.now() + sw.intervalDays * DAY) : null,
-    remindersSent: 0,
-  });
+export function switchOf(u: Row): DeathSwitch {
+  return {
+    enabled: u.ds_enabled as boolean,
+    intervalDays: u.ds_interval_days as number,
+    graceDays: u.ds_grace_days as number,
+    quorum: u.ds_quorum as number,
+    contestHours: u.ds_contest_hours as number,
+    allowUnattended: u.ds_allow_unattended as boolean,
+    lastCheckinAt: u.ds_last_checkin_at ? new Date(u.ds_last_checkin_at as string).toISOString() : null,
+    nextDueAt: u.ds_next_due_at ? new Date(u.ds_next_due_at as string).toISOString() : null,
+  };
 }
 
-export async function openCaseFor(uid: string) {
-  const s = await db().collection("deathCases").where("ownerUid", "==", uid).get();
-  return s.docs.find((d) => ["AWAITING_EXECUTORS", "CONTEST", "NEEDS_REVIEW"].includes(d.get("status"))) ?? null;
+export async function checkIn(uid: string) {
+  await sql()`
+    update users set
+      ds_last_checkin_at = now(),
+      ds_next_due_at = case when ds_enabled then now() + make_interval(days => ds_interval_days) else null end,
+      ds_reminders_sent = 0
+    where id = ${uid}`;
+}
+
+export async function openCaseFor(uid: string): Promise<Row | null> {
+  const [c] = await sql()`select * from death_cases where owner_id = ${uid} and status in ('AWAITING_EXECUTORS', 'CONTEST', 'NEEDS_REVIEW')`;
+  return c ?? null;
 }
 
 export async function acceptedExecutors(uid: string) {
-  const s = await db().collection("executors").where("ownerUid", "==", uid).get();
-  return s.docs.filter((d) => d.get("status") === "ACCEPTED");
+  return sql()`select * from executors where owner_id = ${uid} and status = 'ACCEPTED'`;
 }
 
 export const effectiveQuorum = (quorum: number, accepted: number) => Math.max(1, Math.min(quorum, accepted));
@@ -212,59 +198,66 @@ export const effectiveQuorum = (quorum: number, accepted: number) => Math.max(1,
 const cancelLink = (uid: string) => `${appUrl()}/checkin?t=${signToken({ uid, p: "checkin" }, 30 * 86400)}`;
 const fmtDate = (d: Date) => new Intl.DateTimeFormat("it-IT", { dateStyle: "full", timeStyle: "short", timeZone: "Europe/Rome" }).format(d);
 
-async function startContest(caseRef: FirebaseFirestore.DocumentReference, ownerUid: string, hours: number) {
+async function startContest(caseId: string, ownerId: string, hours: number) {
   const until = new Date(Date.now() + hours * 3_600_000);
-  await caseRef.update({ status: "CONTEST", contestUntil: Timestamp.fromDate(until) });
-  const owner = await db().collection("users").doc(ownerUid).get();
-  await sendTemplate(owner.get("email"), templates.caseOpened({ name: owner.get("displayName"), link: cancelLink(ownerUid), contestUntil: fmtDate(until) })).catch(() => {});
-  await audit(ownerUid, "DEATH_CASE_CONTEST", { caseId: caseRef.id, hours });
+  await sql()`update death_cases set status = 'CONTEST', contest_until = ${until} where id = ${caseId}`;
+  const [owner] = await sql()`select email, display_name from users where id = ${ownerId}`;
+  await sendTemplate(owner.email, templates.caseOpened({ name: owner.display_name, link: cancelLink(ownerId), contestUntil: fmtDate(until) })).catch(() => {});
+  await audit(ownerId, "DEATH_CASE_CONTEST", { caseId, hours });
 }
 
 export async function openDeathCase(uid: string, reason: string) {
   if (await openCaseFor(uid)) return;
-  const owner = await db().collection("users").doc(uid).get();
-  const sw: DeathSwitch = { ...DEFAULT_SWITCH, ...(owner.get("deathSwitch") ?? {}) };
+  const [owner] = await sql()`select * from users where id = ${uid}`;
+  const sw = switchOf(owner);
   const execs = await acceptedExecutors(uid);
-  const ref = await db().collection("deathCases").add({ ownerUid: uid, reason, status: "AWAITING_EXECUTORS", decisions: {}, openedAt: FieldValue.serverTimestamp() });
-  await audit(uid, "DEATH_CASE_OPENED", { caseId: ref.id, reason });
+  const [c] = await sql()`
+    insert into death_cases (owner_id, reason, status) values (${uid}, ${reason}, 'AWAITING_EXECUTORS')
+    on conflict do nothing returning id`;
+  if (!c) return;
+  await audit(uid, "DEATH_CASE_OPENED", { caseId: c.id, reason });
 
   // The owner is always warned first: they might simply be away.
-  await sendTemplate(owner.get("email"), templates.caseOpened({ name: owner.get("displayName"), link: cancelLink(uid) })).catch(() => {});
+  await sendTemplate(owner.email, templates.caseOpened({ name: owner.display_name, link: cancelLink(uid) })).catch(() => {});
 
   if (execs.length > 0) {
     for (const e of execs) {
       await sendTemplate(
-        openStr(e.get("sealedEmail")),
-        templates.executorCase({ executorName: openStr(e.get("sealedName")), ownerName: owner.get("displayName"), link: `${appUrl()}/app/trust` }),
+        openStr(e.sealed_email),
+        templates.executorCase({ executorName: openStr(e.sealed_name), ownerName: owner.display_name, link: `${appUrl()}/app/trust` }),
       ).catch((err) => console.error("[case] executor email", err));
     }
   } else if (sw.allowUnattended && reason === "CHECKIN_MISSED") {
-    await startContest(ref, uid, 14 * 24); // no executors: a much longer waiting period
+    await startContest(c.id, uid, 14 * 24); // no executors: a much longer waiting period
   } else {
-    await ref.update({ status: "NEEDS_REVIEW" });
+    await sql()`update death_cases set status = 'NEEDS_REVIEW' where id = ${c.id}`;
   }
 }
 
 export async function recordExecutorDecision(caseId: string, executorId: string, decision: "CONFIRM" | "DENY") {
-  const ref = db().collection("deathCases").doc(caseId);
-  const c = await ref.get();
-  if (c.get("status") !== "AWAITING_EXECUTORS") return c.get("status");
-  await ref.update({ [`decisions.${executorId}`]: decision });
-  const decisions = { ...(c.get("decisions") ?? {}), [executorId]: decision } as Record<string, string>;
-  const owner = await db().collection("users").doc(c.get("ownerUid")).get();
-  const sw: DeathSwitch = { ...DEFAULT_SWITCH, ...(owner.get("deathSwitch") ?? {}) };
-  const accepted = (await acceptedExecutors(c.get("ownerUid"))).length;
+  const [c] = await sql()`
+    update death_cases set decisions = decisions || ${sql().json({ [executorId]: decision })}
+    where id = ${caseId} and status = 'AWAITING_EXECUTORS'
+    returning *`;
+  if (!c) {
+    const [cur] = await sql()`select status from death_cases where id = ${caseId}`;
+    return cur?.status ?? null;
+  }
+  const [owner] = await sql()`select * from users where id = ${c.owner_id}`;
+  const sw = switchOf(owner);
+  const accepted = (await acceptedExecutors(c.owner_id)).length;
   const q = effectiveQuorum(sw.quorum, accepted);
-  const confirms = Object.values(decisions).filter((d) => d === "CONFIRM").length;
-  const denies = Object.values(decisions).filter((d) => d === "DENY").length;
-  await audit(c.get("ownerUid"), "EXECUTOR_DECISION", { caseId, decision });
+  const values = Object.values(c.decisions as Record<string, string>);
+  const confirms = values.filter((d) => d === "CONFIRM").length;
+  const denies = values.filter((d) => d === "DENY").length;
+  await audit(c.owner_id, "EXECUTOR_DECISION", { caseId, decision });
   if (confirms >= q) {
-    await startContest(ref, c.get("ownerUid"), sw.contestHours);
+    await startContest(caseId, c.owner_id, sw.contestHours);
     return "CONTEST";
   }
   if (denies > accepted - q) {
-    await ref.update({ status: "REJECTED", closedAt: FieldValue.serverTimestamp() });
-    await checkIn(c.get("ownerUid"));
+    await sql()`update death_cases set status = 'REJECTED', closed_at = now() where id = ${caseId}`;
+    await checkIn(c.owner_id);
     return "REJECTED";
   }
   return "AWAITING_EXECUTORS";
@@ -273,60 +266,51 @@ export async function recordExecutorDecision(caseId: string, executorId: string,
 export async function cancelOpenCase(uid: string, by: string) {
   const c = await openCaseFor(uid);
   if (c) {
-    await c.ref.update({ status: "CANCELLED", closedAt: FieldValue.serverTimestamp(), cancelledBy: by });
-    await audit(uid, "DEATH_CASE_CANCELLED", { caseId: c.id, by });
+    await sql()`update death_cases set status = 'CANCELLED', closed_at = now(), cancelled_by = ${by} where id = ${c.id}`;
+    await audit(uid, "DEATH_CASE_CANCELLED", { caseId: c.id as string, by });
   }
   await checkIn(uid);
 }
 
-async function confirmDeath(caseDoc: DocumentSnapshot) {
-  const uid = caseDoc.get("ownerUid") as string;
-  await caseDoc.ref.update({ status: "CONFIRMED", closedAt: FieldValue.serverTimestamp() });
-  await db().collection("users").doc(uid).update({ status: "DECEASED", "deathSwitch.enabled": false, "deathSwitch.nextDueAt": null });
-  await audit(uid, "DEATH_CONFIRMED", { caseId: caseDoc.id });
-
-  const msgs = await db().collection("messages").where("ownerUid", "==", uid).get();
-  const armed = msgs.docs.filter((m) => m.get("status") === "ARMED" && ["DEATH", "DATE_OR_DEATH"].includes(m.get("trigger")?.kind));
-  for (const m of armed) {
-    const ds = await db().collection("deliveries").where("messageId", "==", m.id).get();
-    const batch = db().batch();
-    for (const d of ds.docs) {
-      if (["WAITING", "PENDING"].includes(d.get("status"))) batch.update(d.ref, { status: "PENDING", pendingDueAt: Timestamp.now() });
-    }
-    batch.update(m.ref, { status: "SCHEDULED", updatedAt: FieldValue.serverTimestamp() });
-    await batch.commit();
-  }
-  const owner = await db().collection("users").doc(uid).get();
+async function confirmDeath(c: Row) {
+  const uid = c.owner_id as string;
+  await sql().begin(async (tx) => {
+    await tx`update death_cases set status = 'CONFIRMED', closed_at = now() where id = ${c.id as string}`;
+    await tx`update users set status = 'DECEASED', ds_enabled = false, ds_next_due_at = null where id = ${uid}`;
+    // Every delivery of an armed post-mortem message becomes due now.
+    await tx`
+      update deliveries d set status = 'PENDING', pending_due_at = now()
+      from messages m
+      where d.message_id = m.id and m.owner_id = ${uid} and m.status = 'ARMED'
+        and m.trigger->>'kind' in ('DEATH', 'DATE_OR_DEATH') and d.status in ('WAITING', 'PENDING')`;
+    await tx`
+      update messages set status = 'SCHEDULED', updated_at = now()
+      where owner_id = ${uid} and status = 'ARMED' and trigger->>'kind' in ('DEATH', 'DATE_OR_DEATH')`;
+  });
+  await audit(uid, "DEATH_CONFIRMED", { caseId: c.id as string });
+  const [owner] = await sql()`select display_name from users where id = ${uid}`;
   for (const e of await acceptedExecutors(uid)) {
-    await sendTemplate(openStr(e.get("sealedEmail")), templates.executorsInformed({ executorName: openStr(e.get("sealedName")), ownerName: owner.get("displayName") })).catch(() => {});
+    await sendTemplate(openStr(e.sealed_email), templates.executorsInformed({ executorName: openStr(e.sealed_name), ownerName: owner.display_name })).catch(() => {});
   }
 }
 
 export async function deathCaseTick() {
-  const due = await db().collection("deathCases").where("contestUntil", "<=", Timestamp.now()).get();
-  let confirmed = 0;
-  for (const c of due.docs) {
-    if (c.get("status") !== "CONTEST") continue;
-    await confirmDeath(c);
-    confirmed++;
-  }
-  return confirmed;
+  const due = await sql()`select * from death_cases where status = 'CONTEST' and contest_until <= now()`;
+  for (const c of due) await confirmDeath(c);
+  return due.length;
 }
 
 export async function deadManSwitchTick() {
-  const due = await db().collection("users").where("deathSwitch.nextDueAt", "<=", Timestamp.now()).get();
+  const due = await sql()`select * from users where ds_enabled and status = 'ACTIVE' and ds_next_due_at <= now()`;
   let reminders = 0, cases = 0;
-  for (const u of due.docs) {
-    const sw: DeathSwitch & { nextDueAt: Timestamp } = { ...DEFAULT_SWITCH, ...u.get("deathSwitch") };
-    if (!sw.enabled || u.get("status") === "DECEASED") continue;
-    const overdueDays = (Date.now() - sw.nextDueAt.toMillis()) / DAY;
-    if (overdueDays < sw.graceDays) {
+  for (const u of due) {
+    const overdueDays = (Date.now() - new Date(u.ds_next_due_at).getTime()) / DAY;
+    if (overdueDays < u.ds_grace_days) {
       const step = Math.floor(overdueDays / 7);
-      const sent = (u.get("remindersSent") ?? 0) as number;
-      if (step >= sent) {
-        const final = step + 1 >= Math.ceil(sw.graceDays / 7);
-        await sendTemplate(u.get("email"), templates.checkinReminder({ name: u.get("displayName"), link: cancelLink(u.id), final })).catch((e) => console.error(e));
-        await u.ref.update({ remindersSent: step + 1 });
+      if (step >= u.ds_reminders_sent) {
+        const final = step + 1 >= Math.ceil(u.ds_grace_days / 7);
+        await sendTemplate(u.email, templates.checkinReminder({ name: u.display_name, link: cancelLink(u.id), final })).catch((e) => console.error(e));
+        await sql()`update users set ds_reminders_sent = ${step + 1} where id = ${u.id}`;
         reminders++;
       }
     } else if (!(await openCaseFor(u.id))) {
@@ -339,32 +323,34 @@ export async function deadManSwitchTick() {
 
 // ------------------------------------------------------------------ maintenance
 
-/** Escrowed codes are kept only 90 days after sending, to allow "send me the code again". */
-async function purgeExpiredCodeReserves() {
-  const s = await db().collection("deliveries").where("reserveExpiresAt", "<=", Timestamp.now()).limit(200).get();
-  for (const d of s.docs) await d.ref.update({ codeReserveSealed: FieldValue.delete(), reserveExpiresAt: FieldValue.delete() });
-  return s.size;
+async function cleanup() {
+  const purged = await sql()`
+    update deliveries set code_reserve_sealed = null, reserve_expires_at = null
+    where reserve_expires_at <= now() returning id`;
+  await sql()`delete from sessions where expires_at < now()`;
+  await sql()`delete from auth_tokens where expires_at < now() - interval '1 day'`;
+  // Attachment chunks uploaded for messages that were never saved.
+  await sql()`
+    delete from chunks c where c.created_at < now() - interval '1 day'
+      and not exists (select 1 from messages m where m.id = c.message_id)`;
+  return purged.length;
 }
 
 /** Runs all periodic jobs. Guarded by a short lease so concurrent invocations don't overlap. */
 export async function runMaintenance(opts: { minIntervalMs?: number } = {}) {
-  const lockRef = db().collection("meta").doc("maintenance");
-  const acquired = await db().runTransaction(async (tx) => {
-    const s = await tx.get(lockRef);
-    const now = Date.now();
-    if ((s.get("lockUntil")?.toMillis?.() ?? 0) > now) return false;
-    if (opts.minIntervalMs && now - (s.get("lastRunAt")?.toMillis?.() ?? 0) < opts.minIntervalMs) return false;
-    tx.set(lockRef, { lockUntil: Timestamp.fromMillis(now + 4 * 60_000), lastRunAt: Timestamp.fromMillis(now) }, { merge: true });
-    return true;
-  });
-  if (!acquired) return { skipped: true };
+  const minInterval = `${Math.floor((opts.minIntervalMs ?? 0) / 1000)} seconds`;
+  const [lock] = await sql()`
+    update app_meta set lock_until = now() + interval '4 minutes', last_run_at = now()
+    where key = 'maintenance' and lock_until < now() and last_run_at < now() - ${minInterval}::interval
+    returning key`;
+  if (!lock) return { skipped: true };
   try {
     const switches = await deadManSwitchTick();
     const confirmed = await deathCaseTick();
     const deliveries = await sweepDueDeliveries();
-    const purgedCodes = await purgeExpiredCodeReserves();
+    const purgedCodes = await cleanup();
     return { switches, confirmed, deliveries, purgedCodes };
   } finally {
-    await lockRef.set({ lockUntil: Timestamp.fromMillis(0) }, { merge: true });
+    await sql()`update app_meta set lock_until = 'epoch' where key = 'maintenance'`;
   }
 }

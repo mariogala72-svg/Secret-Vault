@@ -16,7 +16,7 @@ export default function PrivacyPage() {
         <li><strong>Metadati operativi</strong>: date di programmazione, stato delle consegne, registro delle attività di sicurezza.</li>
       </ul>
       <h2>Fornitori</h2>
-      <p>Google Firebase (autenticazione e database), Vercel (hosting), Resend (invio email) ed eventualmente Twilio (SMS), con accordi sul trattamento dei dati.</p>
+      <p>Supabase (database, server in UE), Vercel (hosting), Resend (invio email) ed eventualmente Twilio (SMS), con accordi sul trattamento dei dati.</p>
       <h2>Conservazione e cancellazione</h2>
       <p>Puoi eliminare il tuo account in qualunque momento dalle impostazioni: le chiavi vengono distrutte subito e i dati cancellati. I codici di accesso custoditi per i destinatari vengono eliminati al più tardi 90 giorni dopo la consegna.</p>
       <h2>I tuoi diritti</h2>

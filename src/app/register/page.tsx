@@ -1,21 +1,19 @@
 "use client";
-import { createUserWithEmailAndPassword, updateProfile } from "firebase/auth";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useState } from "react";
-import { AuthShell, NotConfigured } from "@/components/auth/auth-shell";
+import { AuthShell } from "@/components/auth/auth-shell";
 import { PasswordStrength, scorePassword } from "@/components/auth/password-strength";
 import { Button } from "@/components/ui/button";
 import { Field, Input, PasswordInput } from "@/components/ui/field";
-import { api, friendlyAuthError } from "@/lib/client/api";
+import { api, errorMessage } from "@/lib/client/api";
 import { useAuth } from "@/lib/client/auth";
-import { clientAuth } from "@/lib/client/firebase";
 
 function RegisterForm() {
   const router = useRouter();
   const params = useSearchParams();
   const next = params.get("next");
-  const { configured } = useAuth();
+  const { refresh } = useAuth();
   const [name, setName] = useState("");
   const [email, setEmail] = useState(params.get("email") ?? "");
   const [password, setPassword] = useState("");
@@ -30,18 +28,15 @@ function RegisterForm() {
     setLoading(true);
     setError(null);
     try {
-      const cred = await createUserWithEmailAndPassword(clientAuth(), email.trim(), password);
-      await updateProfile(cred.user, { displayName: name.trim() });
-      await api("/api/me", { method: "POST", json: { displayName: name.trim() } });
-      await api("/api/auth/verification", { method: "POST" }).catch(() => {});
+      await api("/api/auth/register", { method: "POST", json: { name: name.trim(), email: email.trim(), password } });
+      await refresh();
       router.replace(`/verify-email${next ? `?next=${encodeURIComponent(next)}` : ""}`);
     } catch (err) {
-      setError(friendlyAuthError(err));
+      setError(errorMessage(err));
       setLoading(false);
     }
   }
 
-  if (!configured) return <NotConfigured />;
   return (
     <form onSubmit={submit} className="space-y-5">
       <Field label="Nome e cognome" hint="È il nome che vedranno i tuoi destinatari.">

@@ -1,46 +1,50 @@
-import { Timestamp } from "firebase-admin/firestore";
 import { z } from "zod";
 import { audit } from "@/lib/server/audit";
 import { requireUser } from "@/lib/server/auth";
-import { acceptedExecutors, DEFAULT_SWITCH, effectiveQuorum, openCaseFor } from "@/lib/server/engine";
-import { db } from "@/lib/server/firebase";
+import { sql } from "@/lib/server/db";
+import { effectiveQuorum, openCaseFor, switchOf } from "@/lib/server/engine";
 import { iso, ok, route } from "@/lib/server/http";
 import { emailIndex, openStr } from "@/lib/server/seal";
 
 /** Everything about the digital will: my settings, my trusted people, and the people who trust me. */
 export const GET = route(async (req) => {
   const user = await requireUser(req);
-  const [me, mine, invites, openCase] = await Promise.all([
-    db().collection("users").doc(user.uid).get(),
-    db().collection("executors").where("ownerUid", "==", user.uid).get(),
-    db().collection("executors").where("emailIdx", "==", emailIndex(user.email)).get(),
+  const [[me], mine, invites, openCase] = await Promise.all([
+    sql()`select * from users where id = ${user.uid}`,
+    sql()`select * from executors where owner_id = ${user.uid} and status <> 'REVOKED' order by created_at`,
+    sql()`
+      select e.id, e.status, u.id as owner_id, u.display_name, u.status as owner_status
+      from executors e join users u on u.id = e.owner_id
+      where e.email_idx = ${emailIndex(user.email)} and e.owner_id <> ${user.uid} and e.status in ('INVITED', 'ACCEPTED')`,
     openCaseFor(user.uid),
   ]);
-  const sw = { ...DEFAULT_SWITCH, ...(me.get("deathSwitch") ?? {}) };
 
   const trustedBy = [];
-  for (const inv of invites.docs) {
-    if (inv.get("ownerUid") === user.uid || inv.get("status") === "DECLINED" || inv.get("status") === "REVOKED") continue;
-    const owner = await db().collection("users").doc(inv.get("ownerUid")).get();
+  for (const inv of invites) {
     let pendingCase = null;
-    if (inv.get("status") === "ACCEPTED") {
-      const c = await openCaseFor(inv.get("ownerUid"));
-      if (c && ["AWAITING_EXECUTORS", "CONTEST"].includes(c.get("status"))) {
-        pendingCase = { id: c.id, status: c.get("status"), myDecision: c.get(`decisions.${inv.id}`) ?? null };
+    if (inv.status === "ACCEPTED") {
+      const c = await openCaseFor(inv.owner_id);
+      if (c && ["AWAITING_EXECUTORS", "CONTEST"].includes(c.status)) {
+        pendingCase = { id: c.id, status: c.status, myDecision: (c.decisions as Record<string, string>)[inv.id] ?? null };
       }
     }
-    trustedBy.push({ id: inv.id, ownerName: owner.get("displayName"), status: inv.get("status"), ownerDeceased: owner.get("status") === "DECEASED", pendingCase });
+    trustedBy.push({ id: inv.id, ownerName: inv.display_name, status: inv.status, ownerDeceased: inv.owner_status === "DECEASED", pendingCase });
   }
 
-  const accepted = mine.docs.filter((d) => d.get("status") === "ACCEPTED").length;
+  const sw = switchOf(me);
+  const accepted = mine.filter((d) => d.status === "ACCEPTED").length;
   return ok({
-    settings: { ...sw, lastCheckinAt: iso(sw.lastCheckinAt), nextDueAt: iso(sw.nextDueAt) },
+    settings: sw,
     effectiveQuorum: accepted ? effectiveQuorum(sw.quorum, accepted) : 0,
-    executors: mine.docs
-      .filter((d) => d.get("status") !== "REVOKED")
-      .map((d) => ({ id: d.id, name: openStr(d.get("sealedName")), emailMasked: d.get("emailMasked"), status: d.get("status") })),
+    executors: mine.map((d) => ({ id: d.id, name: openStr(d.sealed_name), emailMasked: d.email_masked, status: d.status })),
     openCase: openCase
-      ? { id: openCase.id, status: openCase.get("status"), reason: openCase.get("reason"), contestUntil: iso(openCase.get("contestUntil")), confirmations: Object.values(openCase.get("decisions") ?? {}).filter((v) => v === "CONFIRM").length }
+      ? {
+          id: openCase.id,
+          status: openCase.status,
+          reason: openCase.reason,
+          contestUntil: iso(openCase.contest_until),
+          confirmations: Object.values(openCase.decisions as Record<string, string>).filter((v) => v === "CONFIRM").length,
+        }
       : null,
     trustedBy,
   });
@@ -57,19 +61,14 @@ const Settings = z.object({
 export const PUT = route(async (req) => {
   const user = await requireUser(req);
   const s = Settings.parse(await req.json());
-  const ref = db().collection("users").doc(user.uid);
-  const now = Date.now();
-  await ref.update({
-    "deathSwitch.enabled": s.enabled,
-    "deathSwitch.intervalDays": s.intervalDays,
-    "deathSwitch.graceDays": 30,
-    "deathSwitch.quorum": s.quorum,
-    "deathSwitch.contestHours": s.contestHours,
-    "deathSwitch.allowUnattended": s.allowUnattended,
-    "deathSwitch.lastCheckinAt": Timestamp.fromMillis(now),
-    "deathSwitch.nextDueAt": s.enabled ? Timestamp.fromMillis(now + s.intervalDays * 86_400_000) : null,
-    remindersSent: 0,
-  });
-  await audit(user.uid, "WILL_SETTINGS_UPDATED", { enabled: s.enabled, executors: (await acceptedExecutors(user.uid)).length });
+  await sql()`
+    update users set
+      ds_enabled = ${s.enabled}, ds_interval_days = ${s.intervalDays}, ds_grace_days = 30, ds_quorum = ${s.quorum},
+      ds_contest_hours = ${s.contestHours}, ds_allow_unattended = ${s.allowUnattended},
+      ds_last_checkin_at = now(),
+      ds_next_due_at = ${s.enabled ? new Date(Date.now() + s.intervalDays * 86_400_000) : null},
+      ds_reminders_sent = 0
+    where id = ${user.uid}`;
+  await audit(user.uid, "WILL_SETTINGS_UPDATED", { enabled: s.enabled });
   return ok();
 });

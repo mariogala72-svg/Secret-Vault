@@ -1,26 +1,34 @@
 import "server-only";
-import type { DocumentSnapshot } from "firebase-admin/firestore";
+import { z } from "zod";
 import type { AuthedUser } from "./auth";
-import { db } from "./firebase";
+import { sql, type Row } from "./db";
 import { HttpError } from "./http";
 import { emailIndex } from "./seal";
 
 /** A recipient sees a delivery only once released, and only with the verified email it was addressed to. */
-export async function getReceivedDelivery(user: AuthedUser, deliveryId: string): Promise<DocumentSnapshot> {
-  const d = await db().collection("deliveries").doc(deliveryId).get();
-  const mine = d.exists && (d.get("redeemedBy") === user.uid || d.get("emailIdx") === emailIndex(user.email));
-  if (!mine || !["SENT", "OPENED"].includes(d.get("status"))) throw new HttpError(404, "Messaggio non trovato");
+export async function getReceivedDelivery(user: AuthedUser, deliveryId: string): Promise<Row> {
+  if (!z.string().uuid().safeParse(deliveryId).success) throw new HttpError(404, "Messaggio non trovato");
+  const [d] = await sql()`
+    select * from deliveries
+    where id = ${deliveryId} and status in ('SENT', 'OPENED')
+      and (redeemed_by = ${user.uid} or email_idx = ${emailIndex(user.email)})`;
+  if (!d) throw new HttpError(404, "Messaggio non trovato");
   return d;
 }
 
-export function assertNotCodeLocked(d: DocumentSnapshot) {
-  const until = d.get("codeLockedUntil")?.toMillis?.() ?? 0;
-  if (until > Date.now()) throw new HttpError(429, "Troppi tentativi con un codice errato. Riprova domani.", "CODE_LOCKED");
+export function assertNotCodeLocked(d: Row) {
+  if (d.code_locked_until && new Date(d.code_locked_until as string).getTime() > Date.now()) {
+    throw new HttpError(429, "Troppi tentativi con un codice errato. Riprova domani.", "CODE_LOCKED");
+  }
 }
 
 export async function canReadMessage(user: AuthedUser, messageId: string): Promise<boolean> {
-  const m = await db().collection("messages").doc(messageId).get();
-  if (m.exists && m.get("ownerUid") === user.uid) return true;
-  const ds = await db().collection("deliveries").where("messageId", "==", messageId).where("emailIdx", "==", emailIndex(user.email)).get();
-  return ds.docs.some((d) => ["SENT", "OPENED"].includes(d.get("status")) && !(d.get("codeLockedUntil")?.toMillis?.() > Date.now()));
+  const [r] = await sql()`
+    select 1 from messages m where m.id = ${messageId} and m.owner_id = ${user.uid}
+    union all
+    select 1 from deliveries d
+    where d.message_id = ${messageId} and d.email_idx = ${emailIndex(user.email)}
+      and d.status in ('SENT', 'OPENED') and (d.code_locked_until is null or d.code_locked_until < now())
+    limit 1`;
+  return !!r;
 }

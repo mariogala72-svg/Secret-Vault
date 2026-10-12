@@ -1,19 +1,14 @@
 import { requireUser } from "@/lib/server/auth";
-import { db } from "@/lib/server/firebase";
+import { sql } from "@/lib/server/db";
 import { iso, ok, route } from "@/lib/server/http";
 import { emailIndex } from "@/lib/server/seal";
 
 export const GET = route(async (req) => {
   const user = await requireUser(req);
-  const ds = await db().collection("deliveries").where("emailIdx", "==", emailIndex(user.email)).get();
-  const released = ds.docs.filter((d) => ["SENT", "OPENED"].includes(d.get("status")));
-  const owners = new Map<string, string>();
-  for (const uid of new Set(released.map((d) => d.get("ownerUid") as string))) {
-    const u = await db().collection("users").doc(uid).get();
-    owners.set(uid, u.get("displayName") ?? "Una persona a te cara");
-  }
-  const items = released
-    .map((d) => ({ id: d.id, senderName: owners.get(d.get("ownerUid")), sentAt: iso(d.get("sentAt")), openedAt: iso(d.get("openedAt")) }))
-    .sort((a, b) => (b.sentAt ?? "").localeCompare(a.sentAt ?? ""));
-  return ok({ items });
+  const rows = await sql()`
+    select d.id, d.sent_at, d.opened_at, u.display_name
+    from deliveries d join users u on u.id = d.owner_id
+    where d.email_idx = ${emailIndex(user.email)} and d.status in ('SENT', 'OPENED')
+    order by d.sent_at desc nulls last`;
+  return ok({ items: rows.map((r) => ({ id: r.id, senderName: r.display_name, sentAt: iso(r.sent_at), openedAt: iso(r.opened_at) })) });
 });

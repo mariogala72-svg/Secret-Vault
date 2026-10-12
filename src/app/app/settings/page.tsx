@@ -1,7 +1,5 @@
 "use client";
-import { updateProfile } from "firebase/auth";
 import { History, KeyRound, LogOut, Trash2, UserRound } from "lucide-react";
-import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { PasswordStrength, scorePassword } from "@/components/auth/password-strength";
@@ -11,7 +9,6 @@ import { Card, Notice, PageHeader } from "@/components/ui/card";
 import { Field, Input, PasswordInput } from "@/components/ui/field";
 import { api, errorMessage } from "@/lib/client/api";
 import { useAuth } from "@/lib/client/auth";
-import { clientAuth } from "@/lib/client/firebase";
 import { useVault } from "@/lib/client/vault";
 import { rewrapForPassword } from "@/lib/crypto/vault";
 
@@ -24,7 +21,6 @@ const ACTIONS: Record<string, string> = {
 };
 
 export default function SettingsPage() {
-  const router = useRouter();
   const { user, me, refresh, logout } = useAuth();
   const { keys } = useVault();
   const [name, setName] = useState(me?.displayName ?? "");
@@ -43,7 +39,6 @@ export default function SettingsPage() {
     setSavingName(true);
     try {
       await api("/api/me", { method: "POST", json: { displayName: name.trim() } });
-      if (clientAuth().currentUser) await updateProfile(clientAuth().currentUser!, { displayName: name.trim() });
       await refresh();
       toast.success("Nome aggiornato");
     } catch (err) {
@@ -121,7 +116,7 @@ export default function SettingsPage() {
         <p className="mt-3 text-sm leading-relaxed text-muted">Cancella in modo definitivo il tuo profilo, la cassaforte e tutti i messaggi, anche quelli già consegnati. Le chiavi vengono distrutte immediatamente: nessuno potrà più leggere nulla.</p>
         <div className="mt-5 flex flex-wrap gap-2">
           <Button variant="danger" onClick={() => setDeleteOpen(true)}>Elimina il mio account</Button>
-          <Button variant="ghost" onClick={() => logout().then(() => router.replace("/"))}><LogOut className="size-4" /> Esci</Button>
+          <Button variant="ghost" onClick={() => logout()}><LogOut className="size-4" /> Esci</Button>
         </div>
       </Card>
 
@@ -134,9 +129,7 @@ export default function SettingsPage() {
         description={<Notice tone="danger">Questa operazione è irreversibile. Tutti i messaggi, programmati e consegnati, saranno cancellati.</Notice>}
         onConfirmed={async () => {
           await api("/api/account", { method: "DELETE" });
-          await logout().catch(() => {});
-          toast.success("Il tuo account è stato eliminato");
-          router.replace("/");
+          await logout();
         }}
       />
     </div>
